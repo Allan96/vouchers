@@ -4,8 +4,8 @@ API NestJS organizada como **monólito modular** com **arquitetura hexagonal / C
 Architecture**. Cada módulo de negócio é uma fatia vertical completa, com as quatro
 camadas: `domain`, `application`, `infrastructure` e `presentation`.
 
-**Stack:** NestJS 12 · TypeScript (ESM) · PostgreSQL 16 · TypeORM · Vitest · Swagger ·
-oxlint · Prettier.
+**Stack:** NestJS 12 · TypeScript (ESM) · PostgreSQL 16 · TypeORM · Redis 7 · Vitest ·
+Swagger · oxlint · Prettier.
 
 ---
 
@@ -27,6 +27,7 @@ oxlint · Prettier.
   - [Módulo vouchers](#módulo-vouchers)
   - [Regras de validação do voucher](#regras-de-validação-do-voucher)
   - [Reserva temporária](#reserva-temporária)
+  - [Usando o voucher](#usando-o-voucher)
 - [Testes](#testes)
 - [Scripts](#scripts)
 - [Criando um novo módulo](#criando-um-novo-módulo)
@@ -36,13 +37,13 @@ oxlint · Prettier.
 
 ## Começando
 
-Pré-requisitos: Node 20.19+, 22.13+ ou 24.11+ (exigência do TypeORM) e um PostgreSQL
-acessível — o `docker-compose.yml` sobe um.
+Pré-requisitos: Node 20.19+, 22.13+ ou 24.11+ (exigência do TypeORM), um PostgreSQL e um
+Redis acessíveis — o `docker-compose.yml` sobe os dois.
 
 ```bash
 npm install
 cp .env.example .env
-npm run db:up          # sobe o Postgres (docker compose)
+npm run db:up          # sobe o Postgres e o Redis (docker compose)
 npm run migration:run  # compila e aplica as migrations
 npm run start:dev
 ```
@@ -104,6 +105,7 @@ src/
 │   ├── application/               # contrato UseCase<Input, Output>
 │   ├── infrastructure/
 │   │   ├── config/env.ts          # validação das variáveis de ambiente no boot
+│   │   ├── cache/redis.module.ts  # cliente Redis compartilhado
 │   │   └── database/
 │   │       ├── database.module.ts # ConfigModule + TypeOrmModule.forRootAsync
 │   │       └── typeorm/           # opções, DataSource do CLI e migrations
@@ -132,17 +134,19 @@ src/
     │
     └── vouchers/
         ├── domain/
-        │   ├── entities/          # Voucher, VoucherReservation
+        │   ├── entities/          # Voucher, VoucherReservation, VoucherUsage
         │   ├── value-objects/     # UserId
         │   ├── errors/            # VoucherNotAvailableError, VoucherLimitReachedError, ...
         │   └── repositories/      # portas Voucher, VoucherUsage e VoucherReservation
         ├── application/
-        │   ├── use-cases/         # ListVouchers, ValidateVoucher
-        │   ├── dtos/              # ValidateVoucherInput, VoucherOutput
+        │   ├── use-cases/         # ListVouchers, ValidateVoucher, UseVoucher
+        │   ├── services/          # VoucherEligibility (regras compartilhadas)
+        │   ├── dtos/              # inputs e VoucherOutput
         │   └── ports/             # Clock
         ├── infrastructure/
         │   ├── persistence/typeorm/    # entities, mapper e repositórios
-        │   ├── persistence/in-memory/  # reservas (produção) e testes
+        │   ├── persistence/redis/      # reservas temporárias
+        │   ├── persistence/in-memory/  # adaptadores usados nos testes
         │   └── services/               # SystemClock
         ├── presentation/http/     # controller, request, presenter
         └── vouchers.module.ts     # composition root do módulo
@@ -170,7 +174,7 @@ ligadas aos adaptadores e os casos de uso são construídos:
     { provide: VoucherRepository, useClass: TypeOrmVoucherRepository },
     {
       provide: VoucherReservationRepository,
-      useClass: InMemoryVoucherReservationRepository,
+      useClass: RedisVoucherReservationRepository,
     },
     { provide: Clock, useClass: SystemClock },
 
@@ -191,8 +195,8 @@ ligadas aos adaptadores e os casos de uso são construídos:
 export class VouchersModule {}
 ```
 
-Trocar o armazenamento das reservas de memória para Redis, por exemplo, é mudar o
-`useClass` de uma linha — nenhum caso de uso muda.
+As reservas já passaram de memória para Redis exatamente assim: um adaptador novo e uma
+linha trocada aqui. Nenhum caso de uso foi tocado.
 
 ### Tratamento de erros
 
@@ -235,6 +239,10 @@ As variáveis são validadas no boot por
 | `DATABASE_NAME`     | obrigatória   | —                                 |
 | `DATABASE_SSL`      | `false`       | `true` habilita SSL na conexão    |
 | `DATABASE_LOGGING`  | `false`       | `true` loga as queries do TypeORM |
+| `REDIS_HOST`        | obrigatória   | Host do Redis (reservas)          |
+| `REDIS_PORT`        | `6379`        | —                                 |
+| `REDIS_PASSWORD`    | vazio         | Opcional                          |
+| `REDIS_DB`          | `0`           | Índice do banco; e2e usa `1`      |
 
 ---
 
@@ -323,6 +331,7 @@ ao domínio, como o `ParseUUIDPipe` em `GET /users/:id`, que usa o corpo padrão
 | GET    | `/users/:id`         | 200 · 400 (id não-uuid) · 404                       |
 | GET    | `/vouchers`          | 200                                                 |
 | POST   | `/vouchers/validate` | 200 · 400 · 404 · 409                               |
+| POST   | `/vouchers/use`      | 201 · 400 · 404 · 409                               |
 
 ### Módulo users
 
@@ -415,8 +424,8 @@ interpretadas.
 ### Reserva temporária
 
 Uma validação bem-sucedida **reserva** o voucher para aquele cliente por 15 minutos. A
-reserva guarda `user_id`, `code` e `expireDate`, e vive em memória, no processo da
-aplicação.
+reserva guarda `user_id`, `code` e `expireDate`, e vive no **Redis**, compartilhada entre
+todas as instâncias da API.
 
 - **Conta como uso temporário** contra o `limit` total — mas só para os _outros_ usuários.
   A reserva do próprio cliente não bloqueia ele mesmo, então revalidar é idempotente.
@@ -424,12 +433,95 @@ aplicação.
   passou. Revalidar dentro da janela mantém a data original.
 - **Não grava nada em `users_vouchers`** — reserva é bloqueio temporário, não uso.
 - **Nada é reservado quando a validação falha.**
-- Reservas vencidas são descartadas na leitura seguinte.
+- Reservas vencidas são descartadas por score antes de cada leitura.
+
+No Redis, cada `code` é um sorted set `vouchers:reservations:{CODE}`: o membro é o
+`user_id` e o score é o `expireDate` em epoch de milissegundos. Isso resolve a contagem de
+reservas ativas com uma única consulta por faixa, e a limpeza das vencidas com um
+`ZREMRANGEBYSCORE`. A chave também recebe TTL igual à reserva mais recente, então um
+código que ninguém valida de novo some sozinho.
+
+#### A reserva também é atômica
+
+Contar as reservas ativas e pegar uma precisa ser um passo só — senão duas validações
+simultâneas na última unidade veem a mesma vaga livre e as duas reservam. Por isso a
+operação é um script Lua ([reserve-voucher.lua](src/modules/vouchers/infrastructure/persistence/redis/reserve-voucher.lua)),
+que o Redis executa como um único comando, sem intercalar outro cliente:
+
+1. `ZREMRANGEBYSCORE` remove as reservas vencidas;
+2. se o usuário já tem uma, devolve a existente com o `expireDate` original;
+3. compara `ZCARD` com as vagas disponíveis e desiste se não houver;
+4. `ZADD` da nova reserva e `PEXPIREAT` na chave.
+
+As vagas disponíveis são `limit` menos os usos já gravados em `users_vouchers`. Do lado
+da porta, isso é `reserve(userId, code, now, maxActiveHolds)`: o caso de uso pede uma
+reserva respeitando um teto e recebe `null` quando não há vaga — sem saber que existe
+script ou sorted set.
+
+Com 1.200 validações simultâneas de usuários diferentes contra um voucher de 1.000 usos,
+o Redis terminou com exatamente 1.000 reservas e 200 respostas 409.
 
 O TTL está em `RESERVATION_TTL_MINUTES`, em
 [voucher-reservation.ts](src/modules/vouchers/domain/entities/voucher-reservation.ts). O
 tempo entra no caso de uso pela porta `Clock`, o que torna as janelas testáveis sem
 espera real.
+
+### Usando o voucher
+
+`POST /vouchers/use` recebe o mesmo payload da validação e consome o voucher: a reserva
+sai do Redis e vira uma linha em `users_vouchers`. Responde 201, com o voucher usado.
+
+```http
+POST /vouchers/use
+{
+  "user_id": "3f1c5e0a-2b3d-4c5e-8f90-123456789abc",
+  "categories": ["electronics"],
+  "code": "welcome10"
+}
+```
+
+- **As mesmas regras da validação são reaplicadas.** O endpoint não confia em uma
+  validação anterior: as cinco checagens rodam de novo antes de gravar. Elas vivem em
+  `VoucherEligibility`, um colaborador que os dois casos de uso compartilham, então as
+  regras não têm como divergir entre `/validate` e `/use`.
+- **Validar antes não é obrigatório.** Quem nunca segurou o voucher pode usá-lo direto,
+  desde que os limites permitam.
+- **A reserva do próprio usuário é liberada**; as dos outros usuários continuam intactas.
+- **Nada é gravado quando uma regra falha.**
+- A partir daí a linha em `users_vouchers` passa a contar nos dois limites, `limit` e
+  `user_limit`.
+
+#### O limite é estrito
+
+Um voucher de 1.000 usos não pode virar 1.001. Checar antes e gravar depois não garante
+isso: duas requisições simultâneas na última unidade leem a mesma contagem, as duas passam
+e as duas gravam.
+
+Por isso a gravação e a checagem são uma operação só, dentro de uma transação:
+
+```sql
+BEGIN;
+  SELECT 1 FROM vouchers WHERE uuid = $1 FOR UPDATE;  -- serializa os usos deste voucher
+  SELECT count(*) FROM users_vouchers WHERE voucher_id = $1;
+  -- recusa se já atingiu o limite, senão:
+  INSERT INTO users_vouchers ...;
+COMMIT;
+```
+
+O `FOR UPDATE` na linha do voucher faz cada uso do **mesmo** voucher esperar o anterior
+terminar, então a contagem é lida sobre um estado que ninguém pode mudar até o commit.
+Vouchers diferentes não disputam nada entre si.
+
+Isso vive no `TypeOrmVoucherUsageRepository`, atrás do método de porta
+`saveWithinLimits(usage, voucher)` — o caso de uso pede "grave respeitando estes limites",
+sem saber que existe transação ou lock. Não existe caminho de escrita sem essa proteção.
+
+A checagem que roda antes, em `VoucherEligibility`, continua valendo: ela dá o erro certo
+rapidamente e leva as reservas em conta. A da transação é a autoritativa.
+
+Há um teste e2e que dispara 25 requisições concorrentes contra um voucher de 5 usos e
+exige exatamente 5 linhas gravadas. No cenário real, 1.200 requisições simultâneas contra
+um voucher de 1.000 usos gravaram 1.000 linhas e devolveram 200 respostas 409.
 
 ---
 
@@ -447,12 +539,13 @@ npm run lint
 | Unitários           | Entidades, value objects e casos de uso, sobre os adaptadores in-memory |
 | `architecture.spec` | As regras de dependência entre camadas e módulos                        |
 | `users.e2e`         | Criação, listagem e busca de usuários contra o Postgres                 |
-| `vouchers.e2e`      | Listagem, as cinco regras de validação e as reservas                    |
+| `vouchers.e2e`      | Listagem, as regras de validação, as reservas no Redis e o uso          |
 | `swagger.e2e`       | O documento OpenAPI: rotas, tags, schemas e respostas de erro           |
 
-Os unitários rodam sem banco porque toda porta tem um adaptador in-memory. Os e2e usam um
-Postgres de verdade: aplicam as migrations no banco `skeleton_v2_test` e truncam as
-tabelas entre os casos. O banco de teste é definido em
+Os unitários rodam sem infraestrutura porque toda porta tem um adaptador in-memory — é o
+que o `InMemoryVoucherReservationRepository` faz pelas reservas. Os e2e usam Postgres e
+Redis de verdade: aplicam as migrations no banco `skeleton_v2_test`, truncam as tabelas
+entre os casos e limpam as chaves `vouchers:reservations:*` do Redis (índice `1`). O banco de teste é definido em
 [vitest.config.e2e.ts](vitest.config.e2e.ts), que também desliga o paralelismo entre
 arquivos, já que o banco é compartilhado.
 
@@ -490,14 +583,15 @@ O teste de arquitetura passa a cobrir o módulo novo automaticamente.
 
 ## Limitações conhecidas
 
-- **Reservas são por processo.** Com mais de uma instância da API, cada uma teria seu
-  próprio conjunto de reservas e o limite total poderia ser furado. O caminho é trocar o
-  adaptador por um Redis com TTL — a porta já está pronta, muda o `useClass`.
-- **Não existe endpoint de resgate.** Nada grava em `users_vouchers` ainda; as contagens
-  de limite só mudam por seed ou por outro processo.
-- **Sem controle de concorrência na validação.** As contagens acontecem antes de qualquer
-  gravação, então duas requisições simultâneas na última unidade disponível passariam as
-  duas. Isso se resolve junto com o resgate, com transação e `SELECT ... FOR UPDATE`.
+- **O Redis é obrigatório para validar vouchers.** Sem ele o endpoint de validação falha;
+  as reservas não têm fallback para memória.
+- **A reserva não garante a unidade.** Cada store é atômico por si — a transação no
+  Postgres para os usos, o script Lua no Redis para as reservas — mas a checagem que soma
+  os dois não é. Sob disputa pesada, um usuário sem reserva pode consumir uma unidade que
+  outro segurava, e este último só descobre ao usar. O limite estrito nunca é violado; o
+  que se perde é a promessa da reserva. Garantir isso de verdade exigiria exigir reserva
+  ativa no `/use` e conferi-la dentro da mesma transação — ou seja, mover as reservas para
+  o Postgres.
 - **Sem validação de payload na borda.** Os decorators do Swagger são só documentação;
   quem rejeita entrada malformada é o domínio. Para validar na borda, instale
   `class-validator` e habilite o `ValidationPipe` global.

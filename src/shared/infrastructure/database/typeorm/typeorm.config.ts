@@ -2,8 +2,20 @@ import type { PostgresDataSourceOptions } from 'typeorm/driver/postgres/Postgres
 import type { Env } from '../../config/env.js';
 import { migrations } from './migrations/index.js';
 
+/** Only the database slice of the environment. */
+export type DatabaseEnv = Pick<
+  Env,
+  | 'DATABASE_HOST'
+  | 'DATABASE_PORT'
+  | 'DATABASE_USER'
+  | 'DATABASE_PASSWORD'
+  | 'DATABASE_NAME'
+  | 'DATABASE_SSL'
+  | 'DATABASE_LOGGING'
+>;
+
 export const buildDataSourceOptions = (
-  env: Env,
+  env: DatabaseEnv,
 ): PostgresDataSourceOptions => ({
   type: 'postgres',
   host: env.DATABASE_HOST,

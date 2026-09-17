@@ -37,6 +37,7 @@ describe('Swagger (e2e)', () => {
       '/users',
       '/users/{id}',
       '/vouchers',
+      '/vouchers/use',
       '/vouchers/validate',
     ]);
   });
@@ -76,6 +77,16 @@ describe('Swagger (e2e)', () => {
     ]);
     expect(schema.properties.validateDate.nullable).toBe(true);
     expect(schema.properties.userLimit.nullable).toBe(true);
+  });
+
+  it('documents the use endpoint as a creation', () => {
+    const operation = document.paths['/vouchers/use'].post;
+
+    expect(operation.tags).toEqual(['vouchers']);
+    expect(Object.keys(operation.responses)).toContain('201');
+    expect(
+      operation.requestBody.content['application/json'].schema.$ref,
+    ).toContain('UseVoucherRequest');
   });
 
   it('documents the domain error responses', () => {

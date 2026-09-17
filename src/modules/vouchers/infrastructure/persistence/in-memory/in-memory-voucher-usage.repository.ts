@@ -1,4 +1,10 @@
 import { Injectable } from '@nestjs/common';
+import type { VoucherUsage } from '../../../domain/entities/voucher-usage.js';
+import type { Voucher } from '../../../domain/entities/voucher.js';
+import {
+  VoucherLimitReachedError,
+  VoucherUserLimitReachedError,
+} from '../../../domain/errors/voucher.errors.js';
 import { VoucherUsageRepository } from '../../../domain/repositories/voucher-usage.repository.js';
 import type { UserId } from '../../../domain/value-objects/user-id.js';
 
@@ -29,5 +35,24 @@ export class InMemoryVoucherUsageRepository extends VoucherUsageRepository {
       (usage) =>
         usage.userId === userId.value && usage.voucherUuid === voucherUuid,
     ).length;
+  }
+
+  async saveWithinLimits(usage: VoucherUsage, voucher: Voucher): Promise<void> {
+    const used = await this.countByVoucher(voucher.uuid);
+    if (used >= voucher.limit) {
+      throw new VoucherLimitReachedError(voucher.code, voucher.limit);
+    }
+
+    if (voucher.userLimit !== null) {
+      const usedByUser = await this.countByUserAndVoucher(
+        usage.userId,
+        voucher.uuid,
+      );
+      if (usedByUser >= voucher.userLimit) {
+        throw new VoucherUserLimitReachedError(voucher.code, voucher.userLimit);
+      }
+    }
+
+    this.add({ userId: usage.userId.value, voucherUuid: usage.voucherUuid });
   }
 }

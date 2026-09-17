@@ -22,6 +22,15 @@ export class VoucherReservation {
     );
   }
 
+  /** Rebuilds a hold read back from the store. */
+  static restore(
+    userId: UserId,
+    code: string,
+    expireDate: Date,
+  ): VoucherReservation {
+    return new VoucherReservation(userId, code, expireDate);
+  }
+
   isActive(now: Date): boolean {
     return this.expireDate.getTime() > now.getTime();
   }

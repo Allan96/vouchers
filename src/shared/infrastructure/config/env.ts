@@ -8,6 +8,10 @@ export interface Env {
   DATABASE_NAME: string;
   DATABASE_SSL: boolean;
   DATABASE_LOGGING: boolean;
+  REDIS_HOST: string;
+  REDIS_PORT: number;
+  REDIS_PASSWORD: string | null;
+  REDIS_DB: number;
 }
 
 const asString = (raw: Record<string, unknown>, key: keyof Env): string => {
@@ -34,6 +38,14 @@ const asNumber = (
 const asBoolean = (raw: Record<string, unknown>, key: keyof Env): boolean =>
   raw[key] === 'true' || raw[key] === true;
 
+const asOptionalString = (
+  raw: Record<string, unknown>,
+  key: keyof Env,
+): string | null => {
+  const value = raw[key];
+  return typeof value === 'string' && value.trim() !== '' ? value.trim() : null;
+};
+
 /** Fails fast at bootstrap when the environment is incomplete. */
 export const validateEnv = (raw: Record<string, unknown>): Env => ({
   NODE_ENV: (raw.NODE_ENV as Env['NODE_ENV']) ?? 'development',
@@ -45,4 +57,8 @@ export const validateEnv = (raw: Record<string, unknown>): Env => ({
   DATABASE_NAME: asString(raw, 'DATABASE_NAME'),
   DATABASE_SSL: asBoolean(raw, 'DATABASE_SSL'),
   DATABASE_LOGGING: asBoolean(raw, 'DATABASE_LOGGING'),
+  REDIS_HOST: asString(raw, 'REDIS_HOST'),
+  REDIS_PORT: asNumber(raw, 'REDIS_PORT', 6379),
+  REDIS_PASSWORD: asOptionalString(raw, 'REDIS_PASSWORD'),
+  REDIS_DB: asNumber(raw, 'REDIS_DB', 0),
 });

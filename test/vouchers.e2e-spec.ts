@@ -5,13 +5,37 @@ import request from 'supertest';
 import { DataSource } from 'typeorm';
 import { UserId } from '../src/modules/vouchers/domain/value-objects/user-id.js';
 import { AppModule } from '../src/app.module.js';
-import { InMemoryVoucherReservationRepository } from '../src/modules/vouchers/infrastructure/persistence/in-memory/in-memory-voucher-reservation.repository.js';
+import { Redis } from 'ioredis';
 import { VoucherReservationRepository } from '../src/modules/vouchers/domain/repositories/voucher-reservation.repository.js';
+import { RESERVATION_KEY_PREFIX } from '../src/modules/vouchers/infrastructure/persistence/redis/redis-voucher-reservation.repository.js';
+import { REDIS_CLIENT } from '../src/shared/infrastructure/cache/redis.module.js';
 
 describe('Vouchers (e2e)', () => {
   let app: INestApplication;
   let dataSource: DataSource;
-  let reservations: InMemoryVoucherReservationRepository;
+  let reservations: VoucherReservationRepository;
+  let redis: Redis;
+  let baseUrl: string;
+
+  /** Fires `times` parallel requests and returns the status codes. */
+  const fireInParallel = (
+    path: string,
+    bodyFor: (index: number) => Record<string, unknown>,
+    times: number,
+  ): Promise<number[]> =>
+    Promise.all(
+      Array.from({ length: times }, async (_, i) => {
+        const response = await fetch(`${baseUrl}${path}`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(bodyFor(i)),
+        });
+        return response.status;
+      }),
+    );
+
+  const userNumber = (i: number) =>
+    `3f1c5e0a-2b3d-4c5e-8f90-${String(i).padStart(12, '0')}`;
 
   const insertVoucher = (overrides: Record<string, unknown> = {}) => {
     const row = {
@@ -54,13 +78,18 @@ describe('Vouchers (e2e)', () => {
 
     app = moduleRef.createNestApplication();
     await app.init();
+    // A real listening server: the concurrency tests fire many parallel
+    // requests, which supertest's per-call ephemeral servers cannot take.
+    await app.listen(0);
+    baseUrl = await app.getUrl();
 
     dataSource = app.get<DataSource>(getDataSourceToken());
     await dataSource.runMigrations();
 
-    reservations = app.get<InMemoryVoucherReservationRepository>(
+    reservations = app.get<VoucherReservationRepository>(
       VoucherReservationRepository,
     );
+    redis = app.get<Redis>(REDIS_CLIENT);
   });
 
   const insertUsage = (userId: string, voucherId: string) =>
@@ -72,11 +101,15 @@ describe('Vouchers (e2e)', () => {
   beforeEach(async () => {
     await dataSource.query('TRUNCATE TABLE "vouchers" CASCADE');
     await dataSource.query('TRUNCATE TABLE "users_vouchers"');
-    // The holds live in memory and survive the truncate.
-    reservations.clear();
+    // The holds live in Redis and survive the truncate.
+    const keys = await redis.keys(`${RESERVATION_KEY_PREFIX}:*`);
+    if (keys.length > 0) {
+      await redis.del(...keys);
+    }
   });
 
   afterAll(async () => {
+    // `app.close()` runs RedisModule's shutdown hook, which closes the client.
     await app?.close();
   });
 
@@ -336,6 +369,48 @@ describe('Vouchers (e2e)', () => {
       expect(ttl).toBeLessThanOrEqual(15 * 60_000 + 5_000);
     });
 
+    it('stores the hold in Redis with a matching key TTL', async () => {
+      await insertVoucher({ code: 'WELCOME10' });
+      const before = Date.now();
+
+      await request(app.getHttpServer())
+        .post('/vouchers/validate')
+        .send(payload)
+        .expect(200);
+
+      const key = `${RESERVATION_KEY_PREFIX}:WELCOME10`;
+      const score = await redis.zscore(key, payload.user_id);
+      const keyTtl = await redis.pttl(key);
+
+      expect(score).not.toBeNull();
+      expect(Number(score) - before).toBeGreaterThan(14 * 60_000);
+      expect(Number(score) - before).toBeLessThanOrEqual(15 * 60_000 + 5_000);
+      // The key expires with the last hold, so unused codes clean themselves up.
+      expect(keyTtl).toBeGreaterThan(0);
+      expect(keyTtl).toBeLessThanOrEqual(15 * 60_000);
+    });
+
+    it('drops holds that expired, by score', async () => {
+      await insertVoucher({ code: 'WELCOME10', limit: 1, user_limit: null });
+      const key = `${RESERVATION_KEY_PREFIX}:WELCOME10`;
+
+      // A hold from another user that expired one minute ago.
+      await redis.zadd(
+        key,
+        Date.now() - 60_000,
+        'aa1c5e0a-2b3d-4c5e-8f90-123456789abc',
+      );
+
+      await request(app.getHttpServer())
+        .post('/vouchers/validate')
+        .send(payload)
+        .expect(200);
+
+      expect(
+        await redis.zscore(key, 'aa1c5e0a-2b3d-4c5e-8f90-123456789abc'),
+      ).toBeNull();
+    });
+
     it("counts another user's hold against the total limit", async () => {
       await insertVoucher({ code: 'WELCOME10', limit: 1, user_limit: null });
 
@@ -374,6 +449,59 @@ describe('Vouchers (e2e)', () => {
         .expect(404)
         .expect(({ body }) => expect(body.error).toBe('VoucherNotFoundError')));
 
+    it('never hands out more holds than the limit under concurrency', async () => {
+      const limit = 5;
+      const attempts = 25;
+      await insertVoucher({ code: 'WELCOME10', limit, user_limit: null });
+
+      const statuses = await fireInParallel(
+        '/vouchers/validate',
+        (i) => ({ ...payload, user_id: userNumber(i) }),
+        attempts,
+      );
+
+      expect(statuses.filter((status) => status === 200)).toHaveLength(limit);
+      expect(statuses.filter((status) => status === 409)).toHaveLength(
+        attempts - limit,
+      );
+
+      const holds = await redis.zcard(`${RESERVATION_KEY_PREFIX}:WELCOME10`);
+      expect(holds).toBe(limit);
+    });
+
+    it('is idempotent for the same user under concurrency', async () => {
+      await insertVoucher({ code: 'WELCOME10', limit: 1, user_limit: null });
+
+      const statuses = await fireInParallel(
+        '/vouchers/validate',
+        () => payload,
+        10,
+      );
+
+      expect(statuses.every((status) => status === 200)).toBe(true);
+      // One user, one hold, and every response saw the same window.
+      expect(await redis.zcard(`${RESERVATION_KEY_PREFIX}:WELCOME10`)).toBe(1);
+    });
+
+    it('counts the persisted usages against the available holds', async () => {
+      const [{ uuid }] = await insertVoucher({
+        code: 'WELCOME10',
+        limit: 2,
+        user_limit: null,
+      });
+      await insertUsage('bb1c5e0a-2b3d-4c5e-8f90-123456789abc', uuid);
+
+      // One unit is already used, so only one hold fits.
+      const statuses = await fireInParallel(
+        '/vouchers/validate',
+        (i) => ({ ...payload, user_id: userNumber(i) }),
+        5,
+      );
+
+      expect(statuses.filter((status) => status === 200)).toHaveLength(1);
+      expect(await redis.zcard(`${RESERVATION_KEY_PREFIX}:WELCOME10`)).toBe(1);
+    });
+
     it('returns 404 for a soft-deleted voucher', async () => {
       await insertVoucher({ code: 'WELCOME10', deleted_at: new Date() });
 
@@ -391,6 +519,172 @@ describe('Vouchers (e2e)', () => {
         .expect(({ body }) =>
           expect(body.error).toBe('InvalidVoucherCodeError'),
         ));
+  });
+
+  describe('POST /vouchers/use', () => {
+    const payload = {
+      user_id: '3f1c5e0a-2b3d-4c5e-8f90-123456789abc',
+      categories: ['books'],
+      code: 'welcome10',
+    };
+
+    const usageRows = (voucherId: string) =>
+      dataSource.query(
+        'SELECT user_id, voucher_id, created_at FROM "users_vouchers" WHERE voucher_id = $1',
+        [voucherId],
+      );
+
+    it('moves the hold from Redis into users_vouchers', async () => {
+      const [{ uuid }] = await insertVoucher({ code: 'WELCOME10' });
+      const key = `${RESERVATION_KEY_PREFIX}:WELCOME10`;
+
+      await request(app.getHttpServer())
+        .post('/vouchers/validate')
+        .send(payload)
+        .expect(200);
+      expect(await redis.zscore(key, payload.user_id)).not.toBeNull();
+
+      const { body } = await request(app.getHttpServer())
+        .post('/vouchers/use')
+        .send(payload)
+        .expect(201);
+
+      expect(body).toMatchObject({ uuid, code: 'WELCOME10' });
+      expect(await redis.zscore(key, payload.user_id)).toBeNull();
+
+      const rows = await usageRows(uuid);
+      expect(rows).toHaveLength(1);
+      expect(rows[0].user_id).toBe(payload.user_id);
+    });
+
+    it('works without validating first', async () => {
+      const [{ uuid }] = await insertVoucher({ code: 'WELCOME10' });
+
+      await request(app.getHttpServer())
+        .post('/vouchers/use')
+        .send(payload)
+        .expect(201);
+
+      expect(await usageRows(uuid)).toHaveLength(1);
+    });
+
+    it('keeps the holds of other users', async () => {
+      const [{ uuid }] = await insertVoucher({ code: 'WELCOME10', limit: 5 });
+      const other = 'aa1c5e0a-2b3d-4c5e-8f90-123456789abc';
+
+      await request(app.getHttpServer())
+        .post('/vouchers/validate')
+        .send({ ...payload, user_id: other })
+        .expect(200);
+
+      await request(app.getHttpServer())
+        .post('/vouchers/use')
+        .send(payload)
+        .expect(201);
+
+      const key = `${RESERVATION_KEY_PREFIX}:WELCOME10`;
+      expect(await redis.zscore(key, other)).not.toBeNull();
+      expect(await usageRows(uuid)).toHaveLength(1);
+    });
+
+    it('exhausts the voucher once the total limit is reached', async () => {
+      const [{ uuid }] = await insertVoucher({
+        code: 'WELCOME10',
+        limit: 1,
+        user_limit: null,
+      });
+
+      await request(app.getHttpServer())
+        .post('/vouchers/use')
+        .send(payload)
+        .expect(201);
+
+      await request(app.getHttpServer())
+        .post('/vouchers/use')
+        .send({ ...payload, user_id: 'aa1c5e0a-2b3d-4c5e-8f90-123456789abc' })
+        .expect(409)
+        .expect(({ body }) =>
+          expect(body.error).toBe('VoucherLimitReachedError'),
+        );
+
+      expect(await usageRows(uuid)).toHaveLength(1);
+    });
+
+    it('enforces the per-user limit', async () => {
+      await insertVoucher({ code: 'WELCOME10', limit: 10, user_limit: 1 });
+
+      await request(app.getHttpServer())
+        .post('/vouchers/use')
+        .send(payload)
+        .expect(201);
+
+      await request(app.getHttpServer())
+        .post('/vouchers/use')
+        .send(payload)
+        .expect(409)
+        .expect(({ body }) =>
+          expect(body.error).toBe('VoucherUserLimitReachedError'),
+        );
+    });
+
+    it('does not record a usage when a rule fails', async () => {
+      const [{ uuid }] = await insertVoucher({
+        code: 'WELCOME10',
+        validate_date: '2020-01-01 00:00:00',
+      });
+
+      await request(app.getHttpServer())
+        .post('/vouchers/use')
+        .send(payload)
+        .expect(409)
+        .expect(({ body }) =>
+          expect(body.message).toBe('O voucher não está mais disponivel'),
+        );
+
+      expect(await usageRows(uuid)).toHaveLength(0);
+    });
+
+    it('returns 404 for an unknown code', () =>
+      request(app.getHttpServer())
+        .post('/vouchers/use')
+        .send({ ...payload, code: 'UNKNOWN' })
+        .expect(404));
+
+    it('never exceeds the limit under concurrent requests', async () => {
+      const limit = 5;
+      const attempts = 25;
+      const [{ uuid }] = await insertVoucher({
+        code: 'WELCOME10',
+        limit,
+        user_limit: null,
+      });
+
+      // Every request targets the last units at the same time.
+      const statuses = await fireInParallel(
+        '/vouchers/use',
+        (i) => ({ ...payload, user_id: userNumber(i) }),
+        attempts,
+      );
+
+      expect(statuses.filter((status) => status === 201)).toHaveLength(limit);
+      expect(statuses.filter((status) => status === 409)).toHaveLength(
+        attempts - limit,
+      );
+      expect(await usageRows(uuid)).toHaveLength(limit);
+    });
+
+    it('never exceeds user_limit under concurrent requests from one user', async () => {
+      const [{ uuid }] = await insertVoucher({
+        code: 'WELCOME10',
+        limit: 100,
+        user_limit: 2,
+      });
+
+      const statuses = await fireInParallel('/vouchers/use', () => payload, 10);
+
+      expect(statuses.filter((status) => status === 201)).toHaveLength(2);
+      expect(await usageRows(uuid)).toHaveLength(2);
+    });
   });
 
   it('hides soft-deleted vouchers', async () => {

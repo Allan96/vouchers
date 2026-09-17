@@ -13,6 +13,7 @@ import { InMemoryVoucherReservationRepository } from '../../infrastructure/persi
 import { InMemoryVoucherUsageRepository } from '../../infrastructure/persistence/in-memory/in-memory-voucher-usage.repository.js';
 import { InMemoryVoucherRepository } from '../../infrastructure/persistence/in-memory/in-memory-voucher.repository.js';
 import { UserId } from '../../domain/value-objects/user-id.js';
+import { VoucherEligibility } from '../services/voucher-eligibility.js';
 import { ValidateVoucherUseCase } from './validate-voucher.use-case.js';
 
 const VOUCHER_UUID = 'ff4b6e1c-6a4a-4f9e-9b6c-0f1d2e3a4b5c';
@@ -67,7 +68,11 @@ describe('ValidateVoucherUseCase', () => {
     vouchers = new InMemoryVoucherRepository();
     usages = new InMemoryVoucherUsageRepository();
     reservations = new InMemoryVoucherReservationRepository();
-    useCase = new ValidateVoucherUseCase(vouchers, usages, reservations, clock);
+    useCase = new ValidateVoucherUseCase(
+      new VoucherEligibility(vouchers, usages, reservations),
+      reservations,
+      clock,
+    );
   });
 
   it('returns the voucher when the user never used it', async () => {

@@ -9,6 +9,7 @@ import {
 import {
   ApiBadRequestResponse,
   ApiConflictResponse,
+  ApiCreatedResponse,
   ApiNotFoundResponse,
   ApiOkResponse,
   ApiOperation,
@@ -16,11 +17,13 @@ import {
 } from '@nestjs/swagger';
 import { ErrorResponse } from '../../../../../shared/presentation/http/responses/error.response.js';
 import { ListVouchersUseCase } from '../../../application/use-cases/list-vouchers.use-case.js';
+import { UseVoucherUseCase } from '../../../application/use-cases/use-voucher.use-case.js';
 import { ValidateVoucherUseCase } from '../../../application/use-cases/validate-voucher.use-case.js';
 import {
   VoucherPresenter,
   VoucherResponse,
 } from '../presenters/voucher.presenter.js';
+import { UseVoucherRequest } from '../requests/use-voucher.request.js';
 import { ValidateVoucherRequest } from '../requests/validate-voucher.request.js';
 
 @ApiTags('vouchers')
@@ -29,6 +32,7 @@ export class VouchersController {
   constructor(
     private readonly listVouchers: ListVouchersUseCase,
     private readonly validateVoucher: ValidateVoucherUseCase,
+    private readonly useVoucher: UseVoucherUseCase,
   ) {}
 
   @Get()
@@ -68,6 +72,36 @@ export class VouchersController {
     @Body() body: ValidateVoucherRequest,
   ): Promise<VoucherResponse> {
     const voucher = await this.validateVoucher.execute({
+      userId: body?.user_id,
+      categories: body?.categories ?? [],
+      code: body?.code,
+    });
+    return VoucherPresenter.toHttp(voucher);
+  }
+
+  @Post('use')
+  @HttpCode(HttpStatus.CREATED)
+  @ApiOperation({
+    summary: 'Use a voucher',
+    description: [
+      'Runs the same checks as the validation and then consumes the voucher:',
+      'the hold leaves Redis and a row is written to `users_vouchers`.',
+      'Validating first is not required.',
+    ].join(' '),
+  })
+  @ApiCreatedResponse({ type: VoucherResponse })
+  @ApiBadRequestResponse({
+    description: 'Malformed user_id or code',
+    type: ErrorResponse,
+  })
+  @ApiNotFoundResponse({ description: 'Unknown code', type: ErrorResponse })
+  @ApiConflictResponse({
+    description:
+      'Expired, not available for the categories, or limit/user_limit reached',
+    type: ErrorResponse,
+  })
+  async use(@Body() body: UseVoucherRequest): Promise<VoucherResponse> {
+    const voucher = await this.useVoucher.execute({
       userId: body?.user_id,
       categories: body?.categories ?? [],
       code: body?.code,
