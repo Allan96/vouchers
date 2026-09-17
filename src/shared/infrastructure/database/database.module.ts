@@ -15,8 +15,6 @@ import { buildDataSourceOptions } from './typeorm/typeorm.config.js';
       inject: [ConfigService],
       useFactory: (config: ConfigService<Env, true>) => ({
         ...buildDataSourceOptions({
-          NODE_ENV: config.get('NODE_ENV', { infer: true }),
-          PORT: config.get('PORT', { infer: true }),
           DATABASE_HOST: config.get('DATABASE_HOST', { infer: true }),
           DATABASE_PORT: config.get('DATABASE_PORT', { infer: true }),
           DATABASE_USER: config.get('DATABASE_USER', { infer: true }),

@@ -1,12 +1,15 @@
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
+import { RedisModule } from '../../shared/infrastructure/cache/redis.module.js';
 import { ListVouchersUseCase } from './application/use-cases/list-vouchers.use-case.js';
+import { UseVoucherUseCase } from './application/use-cases/use-voucher.use-case.js';
 import { ValidateVoucherUseCase } from './application/use-cases/validate-voucher.use-case.js';
+import { VoucherEligibility } from './application/services/voucher-eligibility.js';
 import { Clock } from './application/ports/clock.js';
 import { VoucherReservationRepository } from './domain/repositories/voucher-reservation.repository.js';
 import { VoucherUsageRepository } from './domain/repositories/voucher-usage.repository.js';
 import { VoucherRepository } from './domain/repositories/voucher.repository.js';
-import { InMemoryVoucherReservationRepository } from './infrastructure/persistence/in-memory/in-memory-voucher-reservation.repository.js';
+import { RedisVoucherReservationRepository } from './infrastructure/persistence/redis/redis-voucher-reservation.repository.js';
 import { TypeOrmVoucherUsageRepository } from './infrastructure/persistence/typeorm/typeorm-voucher-usage.repository.js';
 import { TypeOrmVoucherRepository } from './infrastructure/persistence/typeorm/typeorm-voucher.repository.js';
 import { VoucherUsageOrmEntity } from './infrastructure/persistence/typeorm/voucher-usage.orm-entity.js';
@@ -17,6 +20,7 @@ import { VouchersController } from './presentation/http/controllers/vouchers.con
 @Module({
   imports: [
     TypeOrmModule.forFeature([VoucherOrmEntity, VoucherUsageOrmEntity]),
+    RedisModule,
   ],
   controllers: [VouchersController],
   providers: [
@@ -25,10 +29,10 @@ import { VouchersController } from './presentation/http/controllers/vouchers.con
       provide: VoucherUsageRepository,
       useClass: TypeOrmVoucherUsageRepository,
     },
-    // Reservations are short-lived holds, kept in this instance's memory.
+    // Short-lived holds, shared between instances through Redis.
     {
       provide: VoucherReservationRepository,
-      useClass: InMemoryVoucherReservationRepository,
+      useClass: RedisVoucherReservationRepository,
     },
     { provide: Clock, useClass: SystemClock },
     {
@@ -37,16 +41,39 @@ import { VouchersController } from './presentation/http/controllers/vouchers.con
         new ListVouchersUseCase(vouchers),
       inject: [VoucherRepository],
     },
+    // Shared rules, so validating and using can never drift apart
     {
-      provide: ValidateVoucherUseCase,
+      provide: VoucherEligibility,
       useFactory: (
         vouchers: VoucherRepository,
         usages: VoucherUsageRepository,
         reservations: VoucherReservationRepository,
-        clock: Clock,
-      ) => new ValidateVoucherUseCase(vouchers, usages, reservations, clock),
+      ) => new VoucherEligibility(vouchers, usages, reservations),
       inject: [
         VoucherRepository,
+        VoucherUsageRepository,
+        VoucherReservationRepository,
+      ],
+    },
+    {
+      provide: ValidateVoucherUseCase,
+      useFactory: (
+        eligibility: VoucherEligibility,
+        reservations: VoucherReservationRepository,
+        clock: Clock,
+      ) => new ValidateVoucherUseCase(eligibility, reservations, clock),
+      inject: [VoucherEligibility, VoucherReservationRepository, Clock],
+    },
+    {
+      provide: UseVoucherUseCase,
+      useFactory: (
+        eligibility: VoucherEligibility,
+        usages: VoucherUsageRepository,
+        reservations: VoucherReservationRepository,
+        clock: Clock,
+      ) => new UseVoucherUseCase(eligibility, usages, reservations, clock),
+      inject: [
+        VoucherEligibility,
         VoucherUsageRepository,
         VoucherReservationRepository,
         Clock,

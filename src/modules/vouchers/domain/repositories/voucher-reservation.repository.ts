@@ -19,5 +19,18 @@ export abstract class VoucherReservationRepository {
     now: Date,
   ): Promise<number>;
 
-  abstract save(reservation: VoucherReservation): Promise<void>;
+  /**
+   * Takes a hold for the user, atomically with the check against
+   * `maxActiveHolds`. Returns the hold the user now has — an existing one keeps
+   * its original `expireDate` — or `null` when there is no slot left.
+   */
+  abstract reserve(
+    userId: UserId,
+    code: string,
+    now: Date,
+    maxActiveHolds: number,
+  ): Promise<VoucherReservation | null>;
+
+  /** Releases the user's hold. Idempotent: removing what is not there is fine. */
+  abstract remove(userId: UserId, code: string): Promise<void>;
 }

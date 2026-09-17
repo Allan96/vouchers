@@ -1,3 +1,5 @@
+import type { VoucherUsage } from '../entities/voucher-usage.js';
+import type { Voucher } from '../entities/voucher.js';
 import type { UserId } from '../value-objects/user-id.js';
 
 export abstract class VoucherUsageRepository {
@@ -9,4 +11,14 @@ export abstract class VoucherUsageRepository {
     userId: UserId,
     voucherUuid: string,
   ): Promise<number>;
+
+  /**
+   * Records a usage atomically with the limit check, so `limit` and
+   * `user_limit` hold under concurrency. Throws `VoucherLimitReachedError` or
+   * `VoucherUserLimitReachedError` when the write would exceed them.
+   */
+  abstract saveWithinLimits(
+    usage: VoucherUsage,
+    voucher: Voucher,
+  ): Promise<void>;
 }
